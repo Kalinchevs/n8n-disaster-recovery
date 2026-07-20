@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.2.0"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -397,6 +397,9 @@ restore_snapshot() {
   RESTORED_DUMP="${RECOVERY_RUN}/var/backups/n8n-staging/postgres-all.sql.gz"
   RESTORED_N8N_DATA=""
   RESTORED_PLAYWRIGHT=""
+  RESTORED_PORTAINER_DATA=""
+  RESTORED_CADDY_CONFIG=""
+  RESTORED_CADDY_DATA=""
 
   local n8n_candidate
   for n8n_candidate in \
@@ -408,6 +411,19 @@ restore_snapshot() {
       break
     fi
   done
+
+  local support_volume_candidate
+  support_volume_candidate="${RECOVERY_RUN}/var/lib/docker/volumes/localai_portainer_data/_data"
+  [[ -d "$support_volume_candidate" ]] && \
+    RESTORED_PORTAINER_DATA="$support_volume_candidate"
+
+  support_volume_candidate="${RECOVERY_RUN}/var/lib/docker/volumes/localai_caddy-config/_data"
+  [[ -d "$support_volume_candidate" ]] && \
+    RESTORED_CADDY_CONFIG="$support_volume_candidate"
+
+  support_volume_candidate="${RECOVERY_RUN}/var/lib/docker/volumes/localai_caddy-data/_data"
+  [[ -d "$support_volume_candidate" ]] && \
+    RESTORED_CADDY_DATA="$support_volume_candidate"
 
   local playwright_candidate
   for playwright_candidate in \
@@ -546,6 +562,52 @@ restore_n8n_volume() {
   ok "n8n persistent data was restored."
 }
 
+container_volume_source() {
+  local container=$1
+  local destination=$2
+
+  docker inspect "$container" \
+    --format "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{.Source}}{{end}}{{end}}"
+}
+
+restore_support_volumes() {
+  step "Creating and restoring Portainer and Caddy volumes"
+  cd "$SELFHOST_DIR"
+  "${COMPOSE[@]}" create caddy portainer
+
+  PORTAINER_VOLUME=$(container_volume_source portainer /data)
+  CADDY_CONFIG_VOLUME=$(container_volume_source caddy /config)
+  CADDY_DATA_VOLUME=$(container_volume_source caddy /data)
+
+  [[ -n "$PORTAINER_VOLUME" && -d "$PORTAINER_VOLUME" ]] || \
+    fail "Could not determine the Portainer volume location."
+  [[ -n "$CADDY_CONFIG_VOLUME" && -d "$CADDY_CONFIG_VOLUME" ]] || \
+    fail "Could not determine the Caddy config volume location."
+  [[ -n "$CADDY_DATA_VOLUME" && -d "$CADDY_DATA_VOLUME" ]] || \
+    fail "Could not determine the Caddy data volume location."
+
+  if [[ -n "$RESTORED_PORTAINER_DATA" ]]; then
+    cp -a "${RESTORED_PORTAINER_DATA}/." "${PORTAINER_VOLUME}/"
+    ok "Portainer data was restored."
+  else
+    warn "Portainer volume data is not present in this older snapshot."
+  fi
+
+  if [[ -n "$RESTORED_CADDY_CONFIG" ]]; then
+    cp -a "${RESTORED_CADDY_CONFIG}/." "${CADDY_CONFIG_VOLUME}/"
+    ok "Caddy configuration volume was restored."
+  else
+    warn "Caddy config volume is not present in this older snapshot."
+  fi
+
+  if [[ -n "$RESTORED_CADDY_DATA" ]]; then
+    cp -a "${RESTORED_CADDY_DATA}/." "${CADDY_DATA_VOLUME}/"
+    ok "Caddy certificate and state data was restored."
+  else
+    warn "Caddy data volume is not present in this older snapshot."
+  fi
+}
+
 restore_playwright() {
   step "Restoring Playwright configuration"
   install -d -m 700 "$PLAYWRIGHT_DIR"
@@ -598,6 +660,12 @@ restore_automation() {
       -e "s#/var/lib/docker/volumes/localai_n8n_storage/_data#${N8N_VOLUME}#g" \
       -e "s#/var/lib/docker/volumes/selfhost-ai_n8n_storage/_data#${N8N_VOLUME}#g" \
       -e "s#/var/lib/docker/volumes/localai_portainer_data/_data/compose/1#${PLAYWRIGHT_DIR}#g" \
+      -e "s#/var/lib/docker/volumes/localai_portainer_data/_data#${PORTAINER_VOLUME}#g" \
+      -e "s#/var/lib/docker/volumes/selfhost-ai_portainer_data/_data#${PORTAINER_VOLUME}#g" \
+      -e "s#/var/lib/docker/volumes/localai_caddy-config/_data#${CADDY_CONFIG_VOLUME}#g" \
+      -e "s#/var/lib/docker/volumes/selfhost-ai_caddy-config/_data#${CADDY_CONFIG_VOLUME}#g" \
+      -e "s#/var/lib/docker/volumes/localai_caddy-data/_data#${CADDY_DATA_VOLUME}#g" \
+      -e "s#/var/lib/docker/volumes/selfhost-ai_caddy-data/_data#${CADDY_DATA_VOLUME}#g" \
       /usr/local/sbin/n8n-daily-backup
 
     bash -n /usr/local/sbin/n8n-daily-backup
@@ -656,6 +724,7 @@ Restored and prepared:
   - N8N_ENCRYPTION_KEY
   - PostgreSQL databases and roles
   - n8n persistent volume
+  - Portainer and Caddy persistent volumes
   - Playwright configuration
   - daily backup automation
 
@@ -758,6 +827,7 @@ EOF
   restore_registry_credentials
   restore_postgres
   restore_n8n_volume
+  restore_support_volumes
   restore_playwright
   restore_automation
   show_pre_activation_summary
