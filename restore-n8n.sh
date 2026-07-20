@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -496,6 +496,14 @@ restore_registry_credentials() {
   fi
 }
 
+regenerate_welcome_page() {
+  step "Regenerating the Selfhost AI welcome page"
+  cd "$SELFHOST_DIR"
+  bash scripts/generate_welcome_page.sh
+  jq empty welcome/data.json
+  ok "Welcome page matches the restored COMPOSE_PROFILES."
+}
+
 wait_for_postgres() {
   local status=""
 
@@ -885,6 +893,7 @@ EOF
   select_snapshot
   restore_snapshot
   restore_selfhost_project
+  regenerate_welcome_page
   restore_registry_credentials
   restore_postgres
   restore_n8n_volume
