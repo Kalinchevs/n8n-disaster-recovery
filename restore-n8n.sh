@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -400,6 +400,9 @@ restore_snapshot() {
   RESTORED_PORTAINER_DATA=""
   RESTORED_CADDY_CONFIG=""
   RESTORED_CADDY_DATA=""
+  RESTORED_GRAFANA_DATA=""
+  RESTORED_PROMETHEUS_DATA=""
+  RESTORED_DATABASUS_DATA=""
 
   local n8n_candidate
   for n8n_candidate in \
@@ -424,6 +427,18 @@ restore_snapshot() {
   support_volume_candidate="${RECOVERY_RUN}/var/lib/docker/volumes/localai_caddy-data/_data"
   [[ -d "$support_volume_candidate" ]] && \
     RESTORED_CADDY_DATA="$support_volume_candidate"
+
+  support_volume_candidate="${RECOVERY_RUN}/var/lib/docker/volumes/localai_grafana/_data"
+  [[ -d "$support_volume_candidate" ]] && \
+    RESTORED_GRAFANA_DATA="$support_volume_candidate"
+
+  support_volume_candidate="${RECOVERY_RUN}/var/lib/docker/volumes/localai_prometheus_data/_data"
+  [[ -d "$support_volume_candidate" ]] && \
+    RESTORED_PROMETHEUS_DATA="$support_volume_candidate"
+
+  support_volume_candidate="${RECOVERY_RUN}/var/lib/docker/volumes/localai_databasus_data/_data"
+  [[ -d "$support_volume_candidate" ]] && \
+    RESTORED_DATABASUS_DATA="$support_volume_candidate"
 
   local playwright_candidate
   for playwright_candidate in \
@@ -608,6 +623,51 @@ restore_support_volumes() {
   fi
 }
 
+restored_profile_enabled() {
+  local profile=$1
+  local profiles
+  profiles=$(sed -n 's/^COMPOSE_PROFILES=//p' "${SELFHOST_DIR}/.env")
+  [[ ",${profiles}," == *",${profile},"* ]]
+}
+
+restore_optional_profile_volume() {
+  local container=$1
+  local destination=$2
+  local restored_source=$3
+  local target_volume
+
+  target_volume=$(container_volume_source "$container" "$destination")
+  [[ -n "$target_volume" && -d "$target_volume" ]] || \
+    fail "Could not determine the ${container} volume location."
+
+  if [[ -n "$restored_source" ]]; then
+    cp -a "${restored_source}/." "${target_volume}/"
+    ok "${container} persistent data was restored."
+  else
+    warn "${container} is enabled, but its data is not present in this older snapshot."
+  fi
+}
+
+restore_standard_optional_profiles() {
+  cd "$SELFHOST_DIR"
+
+  if restored_profile_enabled monitoring; then
+    step "Restoring the Selfhost AI monitoring profile"
+    "${COMPOSE[@]}" create prometheus grafana
+    restore_optional_profile_volume \
+      grafana /var/lib/grafana "$RESTORED_GRAFANA_DATA"
+    restore_optional_profile_volume \
+      prometheus /prometheus "$RESTORED_PROMETHEUS_DATA"
+  fi
+
+  if restored_profile_enabled databasus; then
+    step "Restoring the Selfhost AI Databasus profile"
+    "${COMPOSE[@]}" create databasus
+    restore_optional_profile_volume \
+      databasus /databasus-data "$RESTORED_DATABASUS_DATA"
+  fi
+}
+
 restore_playwright() {
   step "Restoring Playwright configuration"
   install -d -m 700 "$PLAYWRIGHT_DIR"
@@ -725,6 +785,7 @@ Restored and prepared:
   - PostgreSQL databases and roles
   - n8n persistent volume
   - Portainer and Caddy persistent volumes
+  - enabled standard Selfhost AI profile data
   - Playwright configuration
   - daily backup automation
 
@@ -828,6 +889,7 @@ EOF
   restore_postgres
   restore_n8n_volume
   restore_support_volumes
+  restore_standard_optional_profiles
   restore_playwright
   restore_automation
   show_pre_activation_summary
