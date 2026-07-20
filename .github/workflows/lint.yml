@@ -1,4 +1,4 @@
-name: Validate recovery script
+name: Validate backup and recovery scripts
 
 on:
   push:
@@ -16,7 +16,8 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Validate Bash syntax
-        run: bash -n restore-n8n.sh
+        run: bash -n restore-n8n.sh n8n-daily-backup
 
       - name: Run ShellCheck
-        run: shellcheck restore-n8n.sh
+        run: shellcheck restore-n8n.sh n8n-daily-backup
+
