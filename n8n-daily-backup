@@ -8,7 +8,8 @@ STAGING_DIR="/var/backups/n8n-staging"
 DUMP_FILE="${STAGING_DIR}/postgres-all.sql.gz"
 DUMP_TMP="${DUMP_FILE}.tmp"
 INVENTORY_FILE="${STAGING_DIR}/recovery-inventory.txt"
-PORTAINER_RESTART_NEEDED=0
+STOPPED_CONTAINERS=()
+OPTIONAL_VOLUME_PATHS=()
 
 volume_source() {
   local container=$1
@@ -18,17 +19,48 @@ volume_source() {
     --format "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{.Source}}{{end}}{{end}}"
 }
 
-restart_portainer() {
-  if (( PORTAINER_RESTART_NEEDED == 1 )); then
-    echo "Starting Portainer..."
-    docker start portainer >/dev/null
-    PORTAINER_RESTART_NEEDED=0
+profile_enabled() {
+  local profile=$1
+  local profiles
+  profiles=$(sed -n 's/^COMPOSE_PROFILES=//p' /root/selfhost-ai/.env)
+  [[ ",${profiles}," == *",${profile},"* ]]
+}
+
+require_optional_volume() {
+  local container=$1
+  local destination=$2
+  local volume_path
+
+  volume_path=$(volume_source "$container" "$destination" 2>/dev/null || true)
+  [[ -n "$volume_path" && -d "$volume_path" ]] || {
+    echo "ERROR: profile is enabled but ${container} volume is missing." >&2
+    exit 1
+  }
+  OPTIONAL_VOLUME_PATHS+=("$volume_path")
+}
+
+stop_for_consistent_backup() {
+  local container=$1
+
+  if [[ "$(docker inspect --format '{{.State.Running}}' "$container")" == "true" ]]; then
+    echo "Stopping ${container} briefly for a consistent volume snapshot..."
+    docker stop --time 30 "$container" >/dev/null
+    STOPPED_CONTAINERS+=("$container")
   fi
+}
+
+restart_stopped_containers() {
+  local index
+  for (( index=${#STOPPED_CONTAINERS[@]}-1; index>=0; index-- )); do
+    echo "Starting ${STOPPED_CONTAINERS[$index]}..."
+    docker start "${STOPPED_CONTAINERS[$index]}" >/dev/null
+  done
+  STOPPED_CONTAINERS=()
 }
 
 cleanup() {
   rm -f -- "$DUMP_TMP"
-  restart_portainer || true
+  restart_stopped_containers || true
 }
 
 trap cleanup EXIT
@@ -53,6 +85,17 @@ do
     exit 1
   }
 done
+
+if profile_enabled monitoring; then
+  echo "Monitoring profile is enabled; including Grafana and Prometheus data."
+  require_optional_volume grafana /var/lib/grafana
+  require_optional_volume prometheus /prometheus
+fi
+
+if profile_enabled databasus; then
+  echo "Databasus profile is enabled; including Databasus data."
+  require_optional_volume databasus /databasus-data
+fi
 
 echo "Creating PostgreSQL dump..."
 
@@ -113,6 +156,7 @@ BACKUP_PATHS=(
   "$PORTAINER_VOLUME"
   "$CADDY_CONFIG_VOLUME"
   "$CADDY_DATA_VOLUME"
+  "${OPTIONAL_VOLUME_PATHS[@]}"
   "$DUMP_FILE"
   "$INVENTORY_FILE"
   /usr/local/sbin/n8n-daily-backup
@@ -130,11 +174,10 @@ if [[ -f /opt/playwright/docker-compose.yml && -f /opt/playwright/stack.env ]]; 
   BACKUP_PATHS+=(/opt/playwright)
 fi
 
-if [[ "$(docker inspect --format '{{.State.Running}}' portainer)" == "true" ]]; then
-  echo "Stopping Portainer briefly for a consistent volume snapshot..."
-  PORTAINER_RESTART_NEEDED=1
-  docker stop --time 30 portainer >/dev/null
-fi
+stop_for_consistent_backup portainer
+profile_enabled monitoring && stop_for_consistent_backup grafana
+profile_enabled monitoring && stop_for_consistent_backup prometheus
+profile_enabled databasus && stop_for_consistent_backup databasus
 
 echo "Creating Restic snapshot..."
 
@@ -146,7 +189,7 @@ restic \
   --tag n8n-daily \
   "${BACKUP_PATHS[@]}"
 
-restart_portainer
+restart_stopped_containers
 
 echo "Applying retention policy..."
 
