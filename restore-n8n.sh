@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.3.0"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -17,6 +17,8 @@ SFTP_PASSWORD_FILE=""
 TEMP_KNOWN_HOSTS=""
 LOG_FILE=""
 SNAPSHOT_JSON_FILE=""
+TELEGRAM_WORKFLOWS_FILE="/tmp/n8n-recovery-telegram-workflows.json"
+TELEGRAM_CREDENTIALS_FILE="/tmp/n8n-recovery-telegram-credentials.json"
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -59,6 +61,13 @@ cleanup() {
   [[ -n "$SFTP_PASSWORD_FILE" ]] && rm -f -- "$SFTP_PASSWORD_FILE"
   [[ -n "$TEMP_KNOWN_HOSTS" ]] && rm -f -- "$TEMP_KNOWN_HOSTS"
   [[ -n "$SNAPSHOT_JSON_FILE" ]] && rm -f -- "$SNAPSHOT_JSON_FILE"
+
+  if command -v docker >/dev/null 2>&1 && \
+     docker inspect n8n >/dev/null 2>&1; then
+    docker exec n8n rm -f -- \
+      "$TELEGRAM_WORKFLOWS_FILE" \
+      "$TELEGRAM_CREDENTIALS_FILE" >/dev/null 2>&1 || true
+  fi
 }
 
 on_error() {
@@ -783,6 +792,224 @@ restore_automation() {
   fi
 }
 
+valid_ipv4() {
+  local ip=$1
+  local octet
+  local -a octets
+
+  IFS=. read -r -a octets <<< "$ip"
+  [[ ${#octets[@]} -eq 4 ]] || return 1
+
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+configure_telegram_webhooks() {
+  local trigger_json
+  local trigger_count
+  local detected_ip=""
+  local target_ip
+  local confirmation
+  local telegram_status=0
+
+  step "Detecting active Telegram Trigger nodes"
+
+  docker exec n8n rm -f -- \
+    "$TELEGRAM_WORKFLOWS_FILE" \
+    "$TELEGRAM_CREDENTIALS_FILE"
+
+  if ! docker exec n8n n8n export:workflow \
+      --all \
+      --output="$TELEGRAM_WORKFLOWS_FILE" >/dev/null; then
+    warn "Could not inspect restored workflows. Telegram webhook recovery was skipped."
+    return 0
+  fi
+
+  trigger_json=$(docker exec n8n node -e '
+    const fs = require("fs");
+    const exported = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const workflows = Array.isArray(exported) ? exported : [exported];
+    const triggers = [];
+
+    for (const workflow of workflows.filter((item) => item.active === true)) {
+      for (const node of workflow.nodes || []) {
+        if (node.type !== "n8n-nodes-base.telegramTrigger") continue;
+        triggers.push({
+          workflow: workflow.name,
+          node: node.name,
+          credential: node.credentials?.telegramApi?.name || "unknown credential",
+        });
+      }
+    }
+
+    process.stdout.write(JSON.stringify(triggers));
+  ' "$TELEGRAM_WORKFLOWS_FILE")
+
+  trigger_count=$(jq 'length' <<< "$trigger_json")
+  if (( trigger_count == 0 )); then
+    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
+    ok "No active Telegram Trigger nodes were found."
+    return 0
+  fi
+
+  title "Telegram webhook failover"
+  printf 'Active Telegram triggers found: %s\n' "$trigger_count"
+  jq -r '.[] | "  - \(.workflow) / \(.node) [\(.credential)]"' <<< "$trigger_json"
+
+  detected_ip=$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
+  detected_ip=${detected_ip//[[:space:]]/}
+  if ! valid_ipv4 "$detected_ip"; then
+    detected_ip=""
+  fi
+
+  printf '\n%s\n' \
+    "Telegram may retain the old VPS address in its DNS cache." \
+    "This step pins restored bot webhooks to the new VPS while preserving n8n secrets." \
+    "Before continuing, stop the old VPS and point the n8n DNS record to this VPS."
+
+  if [[ -n "$detected_ip" ]]; then
+    read_default target_ip "New VPS public IPv4" "$detected_ip"
+  else
+    read -r -p "New VPS public IPv4: " target_ip
+  fi
+
+  if ! valid_ipv4 "$target_ip"; then
+    warn "Invalid IPv4 address. Telegram webhook recovery was skipped."
+    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
+    return 0
+  fi
+
+  read -r -p \
+    "Type TELEGRAM to redirect these bot webhooks to ${target_ip}: " \
+    confirmation
+
+  if [[ "$confirmation" != "TELEGRAM" ]]; then
+    warn "Telegram webhook redirection was skipped."
+    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
+    return 0
+  fi
+
+  step "Securely exporting Telegram credentials inside the n8n container"
+  if ! docker exec n8n n8n export:credentials \
+      --all \
+      --decrypted \
+      --output="$TELEGRAM_CREDENTIALS_FILE" >/dev/null; then
+    warn "Credential export failed. Telegram webhook recovery was skipped."
+    docker exec n8n rm -f -- \
+      "$TELEGRAM_WORKFLOWS_FILE" \
+      "$TELEGRAM_CREDENTIALS_FILE"
+    return 0
+  fi
+  docker exec n8n chmod 600 "$TELEGRAM_CREDENTIALS_FILE"
+
+  step "Redirecting Telegram webhooks to ${target_ip}"
+  docker exec -i n8n node - \
+    "$target_ip" \
+    "$TELEGRAM_WORKFLOWS_FILE" \
+    "$TELEGRAM_CREDENTIALS_FILE" <<'NODE' || telegram_status=$?
+const fs = require('fs');
+
+const targetIp = process.argv[2];
+const workflowExport = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const credentials = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
+const workflows = Array.isArray(workflowExport) ? workflowExport : [workflowExport];
+const activeTriggers = [];
+
+for (const workflow of workflows.filter((item) => item.active === true)) {
+  for (const node of workflow.nodes || []) {
+    if (node.type === 'n8n-nodes-base.telegramTrigger') {
+      activeTriggers.push({ workflow, node });
+    }
+  }
+}
+
+const credentialUse = new Set();
+let failures = 0;
+
+async function telegramRequest(baseUrl, token, method, body) {
+  const response = await fetch(`${baseUrl}/bot${token}/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await response.json();
+  if (!data.ok) throw new Error(data.description || `${method} failed`);
+  return data.result;
+}
+
+(async () => {
+  for (const { workflow, node } of activeTriggers) {
+    const label = `${workflow.name} / ${node.name}`;
+
+    try {
+      const credentialId = node.credentials?.telegramApi?.id;
+      const credential = credentials.find(
+        (item) => item.type === 'telegramApi' &&
+          (!credentialId || String(item.id) === String(credentialId)),
+      );
+
+      if (!credential) throw new Error('matching Telegram credential not found');
+      if (credentialUse.has(String(credential.id))) {
+        throw new Error('the same bot credential is used by more than one active trigger');
+      }
+      credentialUse.add(String(credential.id));
+
+      const token = credential.data?.accessToken;
+      if (!token) throw new Error('Telegram access token is missing');
+
+      const baseUrl = String(
+        credential.data?.baseUrl || 'https://api.telegram.org',
+      ).replace(/\/$/, '');
+      const current = await telegramRequest(baseUrl, token, 'getWebhookInfo', {});
+      if (!current.url) throw new Error('Telegram has no active webhook URL');
+
+      const secretToken = `${workflow.id}_${node.id}`
+        .replace(/[^a-zA-Z0-9_-]+/g, '');
+      const updates = node.parameters?.updates || [];
+
+      await telegramRequest(baseUrl, token, 'setWebhook', {
+        url: current.url,
+        ip_address: targetIp,
+        secret_token: secretToken,
+        allowed_updates: updates.includes('*') ? [] : updates,
+      });
+
+      const verified = await telegramRequest(baseUrl, token, 'getWebhookInfo', {});
+      if (verified.ip_address !== targetIp) {
+        throw new Error(`Telegram reports IP ${verified.ip_address || 'unknown'}`);
+      }
+
+      console.log(
+        `OK: ${label} -> ${verified.ip_address}; pending updates: ` +
+        `${verified.pending_update_count || 0}`,
+      );
+    } catch (error) {
+      failures += 1;
+      console.error(`ERROR: ${label}: ${error.message}`);
+    }
+  }
+
+  if (failures > 0) process.exitCode = 1;
+})().catch((error) => {
+  console.error(`ERROR: Telegram webhook recovery failed: ${error.message}`);
+  process.exitCode = 1;
+});
+NODE
+
+  docker exec n8n rm -f -- \
+    "$TELEGRAM_WORKFLOWS_FILE" \
+    "$TELEGRAM_CREDENTIALS_FILE"
+
+  if (( telegram_status != 0 )); then
+    warn "One or more Telegram webhooks could not be redirected. Review the messages above."
+    return 0
+  fi
+
+  ok "Telegram webhooks now use the new VPS public IP."
+}
+
 show_pre_activation_summary() {
   title "Recovery preparation completed"
   cat <<EOF
@@ -846,6 +1073,8 @@ activate_services() {
 
   title "Container status"
   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+  configure_telegram_webhooks
 
   title "Manual checks still required"
   cat <<'EOF'
