@@ -43,7 +43,15 @@
 
 ## Запуск на новом VPS
 
-Откройте root-сессию и выполните:
+Откройте root-сессию и выполните одной строкой:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Kalinchevs/n8n-disaster-recovery/main/restore-n8n.sh)
+```
+
+Этот вариант не сохраняет скрипт на диске и оставляет терминал доступным для интерактивного ввода паролей и подтверждений.
+
+Если перед запуском требуется прочитать код, сначала сохраните его:
 
 ```bash
 curl -fsSL \
@@ -51,13 +59,8 @@ curl -fsSL \
   -o /root/restore-n8n.sh
 
 chmod 700 /root/restore-n8n.sh
-bash /root/restore-n8n.sh
-```
-
-Перед запуском рекомендуется просмотреть скрипт:
-
-```bash
 less /root/restore-n8n.sh
+bash /root/restore-n8n.sh
 ```
 
 ## Безопасность
