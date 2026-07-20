@@ -350,9 +350,8 @@ restore_selfhost_project() {
 
 wait_for_postgres() {
   local status=""
-  local attempt
 
-  for attempt in $(seq 1 90); do
+  for _ in $(seq 1 90); do
     status=$(docker inspect \
       --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
       postgres 2>/dev/null || true)
