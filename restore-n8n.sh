@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -550,6 +550,24 @@ restore_playwright() {
   step "Restoring Playwright configuration"
   install -d -m 700 "$PLAYWRIGHT_DIR"
   cp -a "${RESTORED_PLAYWRIGHT}/." "${PLAYWRIGHT_DIR}/"
+
+  local n8n_network
+  n8n_network=$(docker inspect n8n \
+    --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' | \
+    head -n 1)
+
+  [[ -n "$n8n_network" ]] || \
+    fail "Could not determine the restored n8n Docker network."
+  docker network inspect "$n8n_network" >/dev/null
+
+  if grep -q 'localai_default' "${PLAYWRIGHT_DIR}/docker-compose.yml"; then
+    sed -i "s/localai_default/${n8n_network}/g" \
+      "${PLAYWRIGHT_DIR}/docker-compose.yml"
+    ok "Playwright Docker network was adapted to ${n8n_network}."
+  else
+    warn "Playwright configuration does not reference localai_default; no network replacement was made."
+  fi
+
   ok "Playwright configuration was restored to ${PLAYWRIGHT_DIR}."
 }
 
