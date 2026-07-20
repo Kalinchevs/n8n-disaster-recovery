@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -339,16 +339,14 @@ select_snapshot() {
       "${SNAPSHOT_IDS[$index]}" "$latest_mark"
   done
 
-  printf '\nChoose a snapshot using:\n'
-  printf '  - Enter or latest          newest snapshot\n'
-  printf '  - 1-%s                     number from the table\n' "$display_count"
-  printf '  - YYYY-MM-DD               newest snapshot from that date\n'
-  printf '  - YYYY-MM-DD HH:MM         snapshot from that exact minute\n'
-  printf '  - snapshot ID              full or short Restic ID\n\n'
+  printf '\nHow to choose:\n'
+  printf '  Enter          newest snapshot (latest)\n'
+  printf '  1-%s            snapshot number from the table\n' "$display_count"
+  printf '  YYYY-MM-DD     newest snapshot from that date, including dates not shown above\n\n'
 
-  local selection matched_count selected_time
+  local selection selected_time
   while true; do
-    read -r -p "Snapshot to restore [latest]: " selection
+    read -r -p "Choose latest, number 1-${display_count}, or date YYYY-MM-DD [latest]: " selection
     selection=${selection:-latest}
 
     if [[ "$selection" == "latest" ]]; then
@@ -373,28 +371,7 @@ select_snapshot() {
       continue
     fi
 
-    if [[ "$selection" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}$ ]]; then
-      SNAPSHOT_ID=$(jq -r --arg selected_minute "${selection/ /T}" \
-        'map(select(.time[0:16] == $selected_minute)) | sort_by(.time) | reverse | .[0].id // empty' \
-        "$SNAPSHOT_JSON_FILE")
-      if [[ -n "$SNAPSHOT_ID" ]]; then
-        break
-      fi
-      warn "No snapshot was found at ${selection}."
-      continue
-    fi
-
-    matched_count=$(jq -r --arg query "$selection" \
-      'map(select(.id | startswith($query))) | length' "$SNAPSHOT_JSON_FILE")
-    if (( matched_count == 1 )); then
-      SNAPSHOT_ID=$(jq -r --arg query "$selection" \
-        'map(select(.id | startswith($query))) | .[0].id' "$SNAPSHOT_JSON_FILE")
-      break
-    elif (( matched_count > 1 )); then
-      warn "The snapshot ID prefix is ambiguous. Enter more characters."
-    else
-      warn "Invalid selection. Enter latest, a table number, a date, or a snapshot ID."
-    fi
+    warn "Invalid selection. Press Enter, enter a table number, or use YYYY-MM-DD."
   done
 
   selected_time=$(jq -r --arg id "$SNAPSHOT_ID" \
