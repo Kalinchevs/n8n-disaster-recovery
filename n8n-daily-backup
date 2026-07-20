@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+REPOSITORY="sftp:homenas-backup:/n8n-backups/restic-n8n"
+PASSWORD_FILE="/root/.config/n8n-backup/restic-password"
+STAGING_DIR="/var/backups/n8n-staging"
+DUMP_FILE="${STAGING_DIR}/postgres-all.sql.gz"
+DUMP_TMP="${DUMP_FILE}.tmp"
+INVENTORY_FILE="${STAGING_DIR}/recovery-inventory.txt"
+PORTAINER_RESTART_NEEDED=0
+
+volume_source() {
+  local container=$1
+  local destination=$2
+
+  docker inspect "$container" \
+    --format "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{.Source}}{{end}}{{end}}"
+}
+
+restart_portainer() {
+  if (( PORTAINER_RESTART_NEEDED == 1 )); then
+    echo "Starting Portainer..."
+    docker start portainer >/dev/null
+    PORTAINER_RESTART_NEEDED=0
+  fi
+}
+
+cleanup() {
+  rm -f -- "$DUMP_TMP"
+  restart_portainer || true
+}
+
+trap cleanup EXIT
+
+mkdir -p "$STAGING_DIR"
+
+echo "Locating persistent volumes..."
+
+N8N_VOLUME=$(volume_source n8n /home/node/.n8n)
+PORTAINER_VOLUME=$(volume_source portainer /data)
+CADDY_CONFIG_VOLUME=$(volume_source caddy /config)
+CADDY_DATA_VOLUME=$(volume_source caddy /data)
+
+for required_path in \
+  "$N8N_VOLUME" \
+  "$PORTAINER_VOLUME" \
+  "$CADDY_CONFIG_VOLUME" \
+  "$CADDY_DATA_VOLUME"
+do
+  [[ -n "$required_path" && -d "$required_path" ]] || {
+    echo "ERROR: required persistent volume path is missing: ${required_path:-empty}" >&2
+    exit 1
+  }
+done
+
+echo "Creating PostgreSQL dump..."
+
+docker exec postgres sh -c \
+  'pg_dumpall --clean --if-exists -U "$POSTGRES_USER"' \
+  | gzip -9 > "$DUMP_TMP"
+
+test -s "$DUMP_TMP"
+gzip -t "$DUMP_TMP"
+mv "$DUMP_TMP" "$DUMP_FILE"
+
+echo "Creating recovery inventory..."
+
+{
+  echo "Backup date:"
+  date --iso-8601=seconds
+
+  echo
+  echo "Operating system:"
+  cat /etc/os-release
+
+  echo
+  echo "Kernel:"
+  uname -a
+
+  echo
+  echo "Docker version:"
+  docker version --format '{{.Server.Version}}'
+
+  echo
+  echo "Restic version:"
+  restic version
+
+  echo
+  echo "Enabled Selfhost AI profiles:"
+  grep '^COMPOSE_PROFILES=' /root/selfhost-ai/.env || true
+
+  echo
+  echo "Containers:"
+  docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+  echo
+  echo "Persistent volume paths:"
+  printf '%s\n' \
+    "n8n=${N8N_VOLUME}" \
+    "portainer=${PORTAINER_VOLUME}" \
+    "caddy-config=${CADDY_CONFIG_VOLUME}" \
+    "caddy-data=${CADDY_DATA_VOLUME}"
+
+  echo
+  echo "Docker volumes:"
+  docker volume ls
+} > "$INVENTORY_FILE"
+
+BACKUP_PATHS=(
+  /root/selfhost-ai
+  "$N8N_VOLUME"
+  "$PORTAINER_VOLUME"
+  "$CADDY_CONFIG_VOLUME"
+  "$CADDY_DATA_VOLUME"
+  "$DUMP_FILE"
+  "$INVENTORY_FILE"
+  /usr/local/sbin/n8n-daily-backup
+  /etc/systemd/system/n8n-daily-backup.service
+  /etc/systemd/system/n8n-daily-backup.timer
+  /root/.config/n8n-backup/restic-password
+  /root/.ssh/config
+  /root/.ssh/known_hosts
+  /root/.ssh/n8n_backup_synology_rsa
+  /root/.ssh/n8n_backup_synology_rsa.pub
+  /root/.docker/config.json
+)
+
+if [[ -f /opt/playwright/docker-compose.yml && -f /opt/playwright/stack.env ]]; then
+  BACKUP_PATHS+=(/opt/playwright)
+fi
+
+if [[ "$(docker inspect --format '{{.State.Running}}' portainer)" == "true" ]]; then
+  echo "Stopping Portainer briefly for a consistent volume snapshot..."
+  PORTAINER_RESTART_NEEDED=1
+  docker stop --time 30 portainer >/dev/null
+fi
+
+echo "Creating Restic snapshot..."
+
+restic \
+  -r "$REPOSITORY" \
+  --password-file "$PASSWORD_FILE" \
+  backup \
+  --host n8n-vps \
+  --tag n8n-daily \
+  "${BACKUP_PATHS[@]}"
+
+restart_portainer
+
+echo "Applying retention policy..."
+
+restic \
+  -r "$REPOSITORY" \
+  --password-file "$PASSWORD_FILE" \
+  forget \
+  --host n8n-vps \
+  --tag n8n-daily \
+  --group-by host,tags \
+  --keep-last 1 \
+  --keep-daily 180 \
+  --prune
+
+echo "Checking repository..."
+
+restic \
+  -r "$REPOSITORY" \
+  --password-file "$PASSWORD_FILE" \
+  check
+
+echo "Backup completed successfully."
+
