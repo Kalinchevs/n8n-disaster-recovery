@@ -313,16 +313,37 @@ restore_snapshot() {
 
   RESTORED_SELFHOST="${RECOVERY_RUN}/root/selfhost-ai"
   RESTORED_DUMP="${RECOVERY_RUN}/var/backups/n8n-staging/postgres-all.sql.gz"
-  RESTORED_N8N_DATA="${RECOVERY_RUN}/var/lib/docker/volumes/localai_n8n_storage/_data"
-  RESTORED_PLAYWRIGHT="${RECOVERY_RUN}/var/lib/docker/volumes/localai_portainer_data/_data/compose/1"
+  RESTORED_N8N_DATA=""
+  RESTORED_PLAYWRIGHT=""
+
+  local n8n_candidate
+  for n8n_candidate in \
+    "${RECOVERY_RUN}/var/lib/docker/volumes/localai_n8n_storage/_data" \
+    "${RECOVERY_RUN}/var/lib/docker/volumes/selfhost-ai_n8n_storage/_data"
+  do
+    if [[ -d "$n8n_candidate" ]]; then
+      RESTORED_N8N_DATA="$n8n_candidate"
+      break
+    fi
+  done
+
+  local playwright_candidate
+  for playwright_candidate in \
+    "${RECOVERY_RUN}/var/lib/docker/volumes/localai_portainer_data/_data/compose/1" \
+    "${RECOVERY_RUN}/opt/playwright"
+  do
+    if [[ -f "${playwright_candidate}/docker-compose.yml" && \
+          -f "${playwright_candidate}/stack.env" ]]; then
+      RESTORED_PLAYWRIGHT="$playwright_candidate"
+      break
+    fi
+  done
 
   [[ -d "$RESTORED_SELFHOST" ]] || fail "Selfhost AI project is missing from the snapshot."
   [[ -s "$RESTORED_DUMP" ]] || fail "PostgreSQL dump is missing or empty."
-  [[ -d "$RESTORED_N8N_DATA" ]] || fail "n8n volume data is missing."
-  [[ -f "${RESTORED_PLAYWRIGHT}/docker-compose.yml" ]] || \
-    fail "Playwright docker-compose.yml is missing."
-  [[ -f "${RESTORED_PLAYWRIGHT}/stack.env" ]] || \
-    fail "Playwright stack.env is missing."
+  [[ -n "$RESTORED_N8N_DATA" && -d "$RESTORED_N8N_DATA" ]] || \
+    fail "n8n volume data is missing."
+  [[ -n "$RESTORED_PLAYWRIGHT" ]] || fail "Playwright configuration is missing."
 
   gzip -t "$RESTORED_DUMP"
   ok "Snapshot files passed validation."
@@ -471,6 +492,17 @@ restore_automation() {
     "${RECOVERY_RUN}/usr/local/sbin/n8n-daily-backup" \
     "/usr/local/sbin/n8n-daily-backup" \
     700 || true
+
+  if [[ -f /usr/local/sbin/n8n-daily-backup ]]; then
+    sed -i \
+      -e "s#/var/lib/docker/volumes/localai_n8n_storage/_data#${N8N_VOLUME}#g" \
+      -e "s#/var/lib/docker/volumes/selfhost-ai_n8n_storage/_data#${N8N_VOLUME}#g" \
+      -e "s#/var/lib/docker/volumes/localai_portainer_data/_data/compose/1#${PLAYWRIGHT_DIR}#g" \
+      /usr/local/sbin/n8n-daily-backup
+
+    bash -n /usr/local/sbin/n8n-daily-backup
+    ok "Backup paths were adapted to this VPS."
+  fi
 
   restore_optional_file \
     "${RECOVERY_RUN}/etc/systemd/system/n8n-daily-backup.service" \
