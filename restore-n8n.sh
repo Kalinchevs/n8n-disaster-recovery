@@ -348,6 +348,20 @@ restore_selfhost_project() {
   ok "Docker Compose configuration is valid."
 }
 
+restore_registry_credentials() {
+  local restored_docker_config
+  restored_docker_config="${RECOVERY_RUN}/root/.docker/config.json"
+
+  if [[ -f "$restored_docker_config" ]]; then
+    step "Restoring encrypted-backup copy of Docker registry credentials"
+    install -D -m 600 "$restored_docker_config" /root/.docker/config.json
+    ok "Docker registry credentials were restored."
+  else
+    warn "Docker registry credentials are not present in this snapshot."
+    warn "If the n8n image is private, a GHCR token will be requested later."
+  fi
+}
+
 wait_for_postgres() {
   local status=""
 
@@ -390,9 +404,34 @@ restore_n8n_volume() {
   step "Creating and restoring the n8n persistent volume"
   cd "$SELFHOST_DIR"
 
-  if ! "${COMPOSE[@]}" create --no-deps n8n; then
-    fail "Could not create n8n. If GHCR authentication is required, run 'docker login ghcr.io' and restart recovery with assistance."
+  local create_log
+  create_log=$(mktemp /run/n8n-recovery-compose.XXXXXX)
+
+  if ! "${COMPOSE[@]}" create n8n 2>&1 | tee "$create_log"; then
+    if grep -Eqi 'unauthorized|denied' "$create_log"; then
+      warn "The n8n image is private and GHCR authentication is required."
+
+      local ghcr_user
+      local ghcr_token
+      read -r -p "GitHub username: " ghcr_user
+      read -r -s -p "GitHub token with read:packages: " ghcr_token
+      printf '\n'
+
+      [[ -n "$ghcr_user" && -n "$ghcr_token" ]] || \
+        fail "GitHub username and token are required."
+
+      printf '%s' "$ghcr_token" | \
+        docker login ghcr.io -u "$ghcr_user" --password-stdin
+      unset ghcr_token
+
+      "${COMPOSE[@]}" create n8n
+    else
+      rm -f -- "$create_log"
+      fail "Docker Compose could not create the n8n container. Review the recovery log."
+    fi
   fi
+
+  rm -f -- "$create_log"
 
   N8N_VOLUME=$(docker inspect n8n \
     --format '{{range .Mounts}}{{if eq .Destination "/home/node/.n8n"}}{{.Source}}{{end}}{{end}}')
@@ -584,6 +623,7 @@ EOF
   select_snapshot
   restore_snapshot
   restore_selfhost_project
+  restore_registry_credentials
   restore_postgres
   restore_n8n_volume
   restore_playwright
