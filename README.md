@@ -46,10 +46,10 @@
 Откройте root-сессию и выполните одной строкой:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Kalinchevs/n8n-disaster-recovery/main/restore-n8n.sh)
+curl -fsSL https://raw.githubusercontent.com/Kalinchevs/n8n-disaster-recovery/main/restore-n8n.sh -o /tmp/restore-n8n.sh && bash /tmp/restore-n8n.sh
 ```
 
-Этот вариант не сохраняет скрипт на диске и оставляет терминал доступным для интерактивного ввода паролей и подтверждений.
+Этот вариант не требует `chmod`, сохраняет временную копию в `/tmp` и оставляет терминал доступным для интерактивного ввода паролей и подтверждений.
 
 Если перед запуском требуется прочитать код, сначала сохраните его:
 
