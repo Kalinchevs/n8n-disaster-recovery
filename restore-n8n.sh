@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -16,6 +16,7 @@ PASSWORD_FILE="${PASSWORD_DIR}/restic-password"
 SFTP_PASSWORD_FILE=""
 TEMP_KNOWN_HOSTS=""
 LOG_FILE=""
+SNAPSHOT_JSON_FILE=""
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -57,6 +58,7 @@ fail() {
 cleanup() {
   [[ -n "$SFTP_PASSWORD_FILE" ]] && rm -f -- "$SFTP_PASSWORD_FILE"
   [[ -n "$TEMP_KNOWN_HOSTS" ]] && rm -f -- "$TEMP_KNOWN_HOSTS"
+  [[ -n "$SNAPSHOT_JSON_FILE" ]] && rm -f -- "$SNAPSHOT_JSON_FILE"
 }
 
 on_error() {
@@ -136,6 +138,7 @@ install_base_packages() {
     curl \
     gnupg \
     gzip \
+    jq \
     openssh-client \
     restic \
     sshpass
@@ -290,12 +293,114 @@ prepare_restic_command() {
 
 select_snapshot() {
   step "Opening the Restic repository"
-  "${RESTIC[@]}" snapshots
+  SNAPSHOT_JSON_FILE=$(mktemp /run/n8n-recovery-snapshots.XXXXXX.json)
+  "${RESTIC[@]}" snapshots --json > "$SNAPSHOT_JSON_FILE"
 
-  printf '\n'
-  read_default SNAPSHOT_ID \
-    "Snapshot ID to restore" \
-    "latest"
+  local snapshot_count
+  snapshot_count=$(jq 'length' "$SNAPSHOT_JSON_FILE")
+  (( snapshot_count > 0 )) || fail "The Restic repository contains no snapshots."
+
+  local display_count=10
+  (( snapshot_count < display_count )) && display_count=$snapshot_count
+
+  mapfile -t SNAPSHOT_IDS < <(
+    jq -r 'sort_by(.time) | reverse | .[:10] | .[].id' "$SNAPSHOT_JSON_FILE"
+  )
+  mapfile -t SNAPSHOT_TIMES < <(
+    jq -r 'sort_by(.time) | reverse | .[:10] | .[].time' "$SNAPSHOT_JSON_FILE"
+  )
+  mapfile -t SNAPSHOT_TAGS < <(
+    jq -r 'sort_by(.time) | reverse | .[:10] | .[] | ((.tags // []) | join(","))' \
+      "$SNAPSHOT_JSON_FILE"
+  )
+
+  step "Calculating restore sizes for the ${display_count} newest snapshots"
+  printf '\nLatest backup snapshots (time zone: Europe/Moscow):\n'
+  printf '  %-3s %-16s  %-9s  %-14s  %-8s\n' "No." "Date and time" "Size" "Tag" "ID"
+  printf '  %-3s %-16s  %-9s  %-14s  %-8s\n' "---" "----------------" "---------" "--------------" "--------"
+
+  local index snapshot_time snapshot_tag stats_json total_size human_size latest_mark
+  for (( index=0; index<display_count; index++ )); do
+    snapshot_time=$(TZ=Europe/Moscow date -d "${SNAPSHOT_TIMES[$index]}" '+%Y-%m-%d %H:%M')
+    snapshot_tag=${SNAPSHOT_TAGS[$index]:--}
+    snapshot_tag=${snapshot_tag:0:14}
+    human_size="unknown"
+
+    if stats_json=$("${RESTIC[@]}" stats --mode restore-size --json \
+        "${SNAPSHOT_IDS[$index]}" 2>/dev/null); then
+      total_size=$(jq -r '.total_size // 0' <<< "$stats_json")
+      human_size=$(numfmt --to=iec-i --suffix=B "$total_size" 2>/dev/null || printf '%sB' "$total_size")
+    fi
+
+    latest_mark=""
+    (( index == 0 )) && latest_mark=" latest"
+    printf '  %-3s %-16s  %-9s  %-14s  %.8s%s\n' \
+      "$((index + 1)))" "$snapshot_time" "$human_size" "$snapshot_tag" \
+      "${SNAPSHOT_IDS[$index]}" "$latest_mark"
+  done
+
+  printf '\nChoose a snapshot using:\n'
+  printf '  - Enter or latest          newest snapshot\n'
+  printf '  - 1-%s                     number from the table\n' "$display_count"
+  printf '  - YYYY-MM-DD               newest snapshot from that date\n'
+  printf '  - YYYY-MM-DD HH:MM         snapshot from that exact minute\n'
+  printf '  - snapshot ID              full or short Restic ID\n\n'
+
+  local selection matched_count selected_time
+  while true; do
+    read -r -p "Snapshot to restore [latest]: " selection
+    selection=${selection:-latest}
+
+    if [[ "$selection" == "latest" ]]; then
+      SNAPSHOT_ID=${SNAPSHOT_IDS[0]}
+      break
+    fi
+
+    if [[ "$selection" =~ ^[0-9]+$ ]] && \
+       (( selection >= 1 && selection <= display_count )); then
+      SNAPSHOT_ID=${SNAPSHOT_IDS[$((selection - 1))]}
+      break
+    fi
+
+    if [[ "$selection" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      SNAPSHOT_ID=$(jq -r --arg selected_date "$selection" \
+        'map(select(.time[0:10] == $selected_date)) | sort_by(.time) | reverse | .[0].id // empty' \
+        "$SNAPSHOT_JSON_FILE")
+      if [[ -n "$SNAPSHOT_ID" ]]; then
+        break
+      fi
+      warn "No snapshot was found for ${selection}."
+      continue
+    fi
+
+    if [[ "$selection" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}$ ]]; then
+      SNAPSHOT_ID=$(jq -r --arg selected_minute "${selection/ /T}" \
+        'map(select(.time[0:16] == $selected_minute)) | sort_by(.time) | reverse | .[0].id // empty' \
+        "$SNAPSHOT_JSON_FILE")
+      if [[ -n "$SNAPSHOT_ID" ]]; then
+        break
+      fi
+      warn "No snapshot was found at ${selection}."
+      continue
+    fi
+
+    matched_count=$(jq -r --arg query "$selection" \
+      'map(select(.id | startswith($query))) | length' "$SNAPSHOT_JSON_FILE")
+    if (( matched_count == 1 )); then
+      SNAPSHOT_ID=$(jq -r --arg query "$selection" \
+        'map(select(.id | startswith($query))) | .[0].id' "$SNAPSHOT_JSON_FILE")
+      break
+    elif (( matched_count > 1 )); then
+      warn "The snapshot ID prefix is ambiguous. Enter more characters."
+    else
+      warn "Invalid selection. Enter latest, a table number, a date, or a snapshot ID."
+    fi
+  done
+
+  selected_time=$(jq -r --arg id "$SNAPSHOT_ID" \
+    'map(select(.id == $id)) | .[0].time' "$SNAPSHOT_JSON_FILE")
+  selected_time=$(TZ=Europe/Moscow date -d "$selected_time" '+%Y-%m-%d %H:%M:%S %Z')
+  ok "Selected snapshot ${SNAPSHOT_ID:0:8} from ${selected_time}."
 
   if confirm "Run a repository integrity check before restore?" "yes"; then
     step "Checking Restic repository integrity"
@@ -668,3 +773,4 @@ EOF
 }
 
 main "$@"
+
