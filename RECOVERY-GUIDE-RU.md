@@ -65,22 +65,10 @@ Redis и Docker-образы не восстанавливаются из коп
 
 Подключитесь к новому VPS по SSH от имени `root`. Не создавайте `/root/selfhost-ai` и не запускайте установщик Selfhost AI вручную.
 
-Самый быстрый запуск:
+Запустите скрипт:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Kalinchevs/n8n-disaster-recovery/main/restore-n8n.sh -o /tmp/restore-n8n.sh && bash /tmp/restore-n8n.sh
-```
-
-Если перед запуском требуется прочитать код:
-
-```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/Kalinchevs/n8n-disaster-recovery/main/restore-n8n.sh \
-  -o /root/restore-n8n.sh
-
-chmod 700 /root/restore-n8n.sh
-less /root/restore-n8n.sh
-bash /root/restore-n8n.sh
 ```
 
 Скрипт создаёт подробный журнал вида:
