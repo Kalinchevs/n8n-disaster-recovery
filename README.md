@@ -1,5 +1,7 @@
 # n8n Disaster Recovery
 
+Подробная пошаговая инструкция по аварийному и тестовому восстановлению: [RECOVERY-GUIDE-RU.md](RECOVERY-GUIDE-RU.md).
+
 Интерактивный bootstrap-скрипт для восстановления self-hosted n8n, PostgreSQL и Playwright из зашифрованного репозитория Restic на Synology.
 
 Скрипт предназначен для конкретной схемы резервного копирования:
