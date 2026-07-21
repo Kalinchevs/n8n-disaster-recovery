@@ -202,20 +202,7 @@ systemctl disable --now n8n-daily-backup.timer
 
 ## 8. DNS, HTTPS и Telegram webhook
 
-После `ACTIVATE` измените A-запись `n8n.codecraftsergo.com` на публичный IPv4 нового VPS. Убедитесь, что DNS уже возвращает новый адрес:
-
-```bash
-getent ahostsv4 n8n.codecraftsergo.com | head -n 1
-```
-
-Проверьте n8n локально через Caddy:
-
-```bash
-curl -skS --resolve n8n.codecraftsergo.com:443:127.0.0.1 \
-  -D - https://n8n.codecraftsergo.com/healthz -o /dev/null
-```
-
-Ожидается `HTTP/2 200` или `HTTP/1.1 200`.
+После `ACTIVATE` измените в панели управления DNS A-запись `n8n.codecraftsergo.com` на публичный IPv4 нового VPS, затем продолжите настройку Telegram webhook в recovery-скрипте.
 
 Telegram может сохранять старый IP в собственном DNS-кэше. Поэтому после запуска скрипт:
 
