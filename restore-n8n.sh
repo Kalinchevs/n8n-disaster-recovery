@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -17,8 +17,11 @@ SFTP_PASSWORD_FILE=""
 TEMP_KNOWN_HOSTS=""
 LOG_FILE=""
 SNAPSHOT_JSON_FILE=""
+ENV_TEMP_FILE=""
 TELEGRAM_WORKFLOWS_FILE="/tmp/n8n-recovery-telegram-workflows.json"
 TELEGRAM_CREDENTIALS_FILE="/tmp/n8n-recovery-telegram-credentials.json"
+N8N_PUBLIC_HOSTNAME=""
+N8N_PUBLIC_ORIGIN=""
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -61,6 +64,7 @@ cleanup() {
   [[ -n "$SFTP_PASSWORD_FILE" ]] && rm -f -- "$SFTP_PASSWORD_FILE"
   [[ -n "$TEMP_KNOWN_HOSTS" ]] && rm -f -- "$TEMP_KNOWN_HOSTS"
   [[ -n "$SNAPSHOT_JSON_FILE" ]] && rm -f -- "$SNAPSHOT_JSON_FILE"
+  [[ -n "$ENV_TEMP_FILE" ]] && rm -f -- "$ENV_TEMP_FILE"
 
   if command -v docker >/dev/null 2>&1 && \
      docker inspect n8n >/dev/null 2>&1; then
@@ -471,6 +475,163 @@ restore_snapshot() {
   ok "Snapshot files passed validation."
 }
 
+unquote_env_value() {
+  local value=$1
+
+  if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+    value=${value:1:${#value}-2}
+  elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+    value=${value:1:${#value}-2}
+  fi
+
+  printf '%s' "$value"
+}
+
+read_env_value() {
+  local variable_name=$1
+  local env_file=$2
+  local value
+
+  value=$(sed -n "s/^${variable_name}=//p" "$env_file" | tail -n 1)
+  unquote_env_value "$value"
+}
+
+valid_hostname() {
+  local hostname=$1
+  local label
+  local -a labels
+
+  [[ -n "$hostname" && ${#hostname} -le 253 ]] || return 1
+  [[ "$hostname" == *.* ]] || return 1
+  [[ "$hostname" != .* && "$hostname" != *. && "$hostname" != *..* ]] || return 1
+
+  IFS=. read -r -a labels <<< "$hostname"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+  done
+}
+
+configure_public_domain() {
+  local env_file="${SELFHOST_DIR}/.env"
+  local old_n8n_hostname
+  local old_base_domain
+  local new_base_domain
+  local variable_name
+  local raw_value
+  local current_hostname
+  local new_hostname
+  local prefix
+  local line
+  local confirmation
+  local replacement_found
+  local -a hostname_variables=()
+  local -a old_hostnames=()
+  local -a new_hostnames=()
+
+  old_n8n_hostname=$(read_env_value N8N_HOSTNAME "$env_file")
+  valid_hostname "$old_n8n_hostname" || \
+    fail "N8N_HOSTNAME in the restored .env is missing or invalid."
+
+  old_n8n_hostname=${old_n8n_hostname,,}
+  old_base_domain=${old_n8n_hostname#*.}
+
+  title "Public domain settings"
+  printf '%s\n' \
+    "Enter the base domain that all restored public service hostnames should use." \
+    "Press Enter to keep every restored hostname unchanged."
+  read_default new_base_domain "Public base domain" "$old_base_domain"
+  new_base_domain=${new_base_domain,,}
+
+  valid_hostname "$new_base_domain" || \
+    fail "The public base domain is not a valid DNS hostname."
+
+  if [[ "$new_base_domain" == "$old_base_domain" ]]; then
+    N8N_PUBLIC_HOSTNAME="$old_n8n_hostname"
+    N8N_PUBLIC_ORIGIN="https://${N8N_PUBLIC_HOSTNAME}"
+    ok "Restored public hostnames will be kept unchanged."
+    return
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z0-9_]+_HOSTNAME)=(.*)$ ]] || continue
+    variable_name=${BASH_REMATCH[1]}
+    raw_value=${BASH_REMATCH[2]}
+    current_hostname=$(unquote_env_value "$raw_value")
+    current_hostname=${current_hostname,,}
+
+    [[ -n "$current_hostname" ]] || continue
+    if ! valid_hostname "$current_hostname"; then
+      warn "${variable_name} is not a plain DNS hostname and will not be changed."
+      continue
+    fi
+
+    if [[ "$current_hostname" == "$old_base_domain" ]]; then
+      new_hostname="$new_base_domain"
+    elif [[ "$current_hostname" == *".${old_base_domain}" ]]; then
+      prefix=${current_hostname%".${old_base_domain}"}
+      new_hostname="${prefix}.${new_base_domain}"
+    else
+      warn "${variable_name} does not use ${old_base_domain} and will not be changed."
+      continue
+    fi
+
+    hostname_variables+=("$variable_name")
+    old_hostnames+=("$current_hostname")
+    new_hostnames+=("$new_hostname")
+  done < "$env_file"
+
+  (( ${#hostname_variables[@]} > 0 )) || \
+    fail "No populated *_HOSTNAME values use ${old_base_domain}."
+
+  printf '\nCalculated hostname changes:\n'
+  local index
+  for (( index=0; index<${#hostname_variables[@]}; index++ )); do
+    printf '  %-28s %s -> %s\n' \
+      "${hostname_variables[$index]}" \
+      "${old_hostnames[$index]}" \
+      "${new_hostnames[$index]}"
+  done
+
+  read -r -p "Type DOMAIN to apply these hostname changes: " confirmation
+  if [[ "$confirmation" != "DOMAIN" ]]; then
+    N8N_PUBLIC_HOSTNAME="$old_n8n_hostname"
+    N8N_PUBLIC_ORIGIN="https://${N8N_PUBLIC_HOSTNAME}"
+    warn "Domain change was cancelled; restored hostnames were kept."
+    return
+  fi
+
+  ENV_TEMP_FILE=$(mktemp "${env_file}.domain.XXXXXX")
+  chmod --reference="$env_file" "$ENV_TEMP_FILE"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    replacement_found="no"
+    if [[ "$line" =~ ^([A-Z0-9_]+_HOSTNAME)= ]]; then
+      variable_name=${BASH_REMATCH[1]}
+      for (( index=0; index<${#hostname_variables[@]}; index++ )); do
+        if [[ "$variable_name" == "${hostname_variables[$index]}" ]]; then
+          printf '%s=%s\n' "$variable_name" "${new_hostnames[$index]}"
+          replacement_found="yes"
+          break
+        fi
+      done
+    fi
+
+    [[ "$replacement_found" == "yes" ]] && continue
+    printf '%s\n' "$line"
+  done < "$env_file" > "$ENV_TEMP_FILE"
+
+  mv -f -- "$ENV_TEMP_FILE" "$env_file"
+  ENV_TEMP_FILE=""
+
+  N8N_PUBLIC_HOSTNAME=$(read_env_value N8N_HOSTNAME "$env_file")
+  N8N_PUBLIC_HOSTNAME=${N8N_PUBLIC_HOSTNAME,,}
+  valid_hostname "$N8N_PUBLIC_HOSTNAME" || \
+    fail "N8N_HOSTNAME became invalid after the domain update."
+  N8N_PUBLIC_ORIGIN="https://${N8N_PUBLIC_HOSTNAME}"
+  ok "Public service hostnames were updated in the restored .env."
+}
+
 restore_selfhost_project() {
   step "Restoring the Selfhost AI project"
   cp -a "$RESTORED_SELFHOST" "$SELFHOST_DIR"
@@ -478,6 +639,8 @@ restore_selfhost_project() {
   [[ -s "${SELFHOST_DIR}/.env" ]] || fail "Restored .env is missing."
   grep -Eq '^N8N_ENCRYPTION_KEY=.+$' "${SELFHOST_DIR}/.env" || \
     fail "N8N_ENCRYPTION_KEY is missing from restored .env."
+
+  configure_public_domain
 
   COMPOSE=(
     docker compose
@@ -488,7 +651,28 @@ restore_selfhost_project() {
 
   cd "$SELFHOST_DIR"
   "${COMPOSE[@]}" config >/dev/null
+
+  local resolved_webhook_url
+  resolved_webhook_url=$(
+    "${COMPOSE[@]}" config |
+      awk '
+        !found && /^[[:space:]]*WEBHOOK_URL:[[:space:]]*/ {
+          sub(/^[[:space:]]*WEBHOOK_URL:[[:space:]]*/, "")
+          gsub(/^"|"$/, "")
+          value=$0
+          found=1
+        }
+        END {
+          if (found) print value
+        }
+      '
+  )
+  resolved_webhook_url=${resolved_webhook_url%/}
+  [[ "$resolved_webhook_url" == "$N8N_PUBLIC_ORIGIN" ]] || \
+    fail "Docker Compose WEBHOOK_URL does not match ${N8N_PUBLIC_ORIGIN}."
+
   ok "Docker Compose configuration is valid."
+  ok "n8n public URL is ${N8N_PUBLIC_ORIGIN}."
 }
 
 restore_registry_credentials() {
@@ -806,6 +990,33 @@ valid_ipv4() {
   done
 }
 
+verify_public_endpoint() {
+  local target_ip=$1
+  local resolved_ips
+
+  step "Checking DNS and HTTPS for ${N8N_PUBLIC_HOSTNAME}"
+  resolved_ips=$(
+    getent ahostsv4 "$N8N_PUBLIC_HOSTNAME" 2>/dev/null |
+      awk '{print $1}' |
+      sort -u
+  )
+
+  if ! grep -Fxq "$target_ip" <<< "$resolved_ips"; then
+    warn "DNS A records for ${N8N_PUBLIC_HOSTNAME} do not point to ${target_ip}."
+    return 1
+  fi
+
+  if ! curl -fsS \
+      --max-time 20 \
+      --resolve "${N8N_PUBLIC_HOSTNAME}:443:${target_ip}" \
+      "${N8N_PUBLIC_ORIGIN}/healthz" >/dev/null; then
+    warn "HTTPS health check failed for ${N8N_PUBLIC_ORIGIN} on ${target_ip}."
+    return 1
+  fi
+
+  ok "DNS and HTTPS are ready for ${N8N_PUBLIC_ORIGIN}."
+}
+
 configure_telegram_webhooks() {
   local trigger_json
   local trigger_count
@@ -881,8 +1092,14 @@ configure_telegram_webhooks() {
     return 0
   fi
 
+  if ! verify_public_endpoint "$target_ip"; then
+    warn "Telegram webhook recovery was skipped until DNS and HTTPS are ready."
+    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
+    return 0
+  fi
+
   read -r -p \
-    "Type TELEGRAM to redirect these bot webhooks to ${target_ip}: " \
+    "Type TELEGRAM to redirect these bot webhooks to ${N8N_PUBLIC_ORIGIN} at ${target_ip}: " \
     confirmation
 
   if [[ "$confirmation" != "TELEGRAM" ]]; then
@@ -904,16 +1121,18 @@ configure_telegram_webhooks() {
   fi
   docker exec n8n chmod 600 "$TELEGRAM_CREDENTIALS_FILE"
 
-  step "Redirecting Telegram webhooks to ${target_ip}"
+  step "Redirecting Telegram webhooks to ${N8N_PUBLIC_ORIGIN} at ${target_ip}"
   docker exec -i n8n node - \
     "$target_ip" \
+    "$N8N_PUBLIC_HOSTNAME" \
     "$TELEGRAM_WORKFLOWS_FILE" \
     "$TELEGRAM_CREDENTIALS_FILE" <<'NODE' || telegram_status=$?
 const fs = require('fs');
 
 const targetIp = process.argv[2];
-const workflowExport = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
-const credentials = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
+const targetHostname = process.argv[3];
+const workflowExport = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
+const credentials = JSON.parse(fs.readFileSync(process.argv[5], 'utf8'));
 const workflows = Array.isArray(workflowExport) ? workflowExport : [workflowExport];
 const activeTriggers = [];
 
@@ -964,13 +1183,18 @@ async function telegramRequest(baseUrl, token, method, body) {
       ).replace(/\/$/, '');
       const current = await telegramRequest(baseUrl, token, 'getWebhookInfo', {});
       if (!current.url) throw new Error('Telegram has no active webhook URL');
+      const currentUrl = new URL(current.url);
+      const targetUrl = new URL(
+        `${currentUrl.pathname}${currentUrl.search}`,
+        `https://${targetHostname}`,
+      ).toString();
 
       const secretToken = `${workflow.id}_${node.id}`
         .replace(/[^a-zA-Z0-9_-]+/g, '');
       const updates = node.parameters?.updates || [];
 
       await telegramRequest(baseUrl, token, 'setWebhook', {
-        url: current.url,
+        url: targetUrl,
         ip_address: targetIp,
         secret_token: secretToken,
         allowed_updates: updates.includes('*') ? [] : updates,
@@ -979,6 +1203,9 @@ async function telegramRequest(baseUrl, token, method, body) {
       const verified = await telegramRequest(baseUrl, token, 'getWebhookInfo', {});
       if (verified.ip_address !== targetIp) {
         throw new Error(`Telegram reports IP ${verified.ip_address || 'unknown'}`);
+      }
+      if (verified.url !== targetUrl) {
+        throw new Error('Telegram reports an unexpected webhook URL');
       }
 
       console.log(
@@ -1007,7 +1234,7 @@ NODE
     return 0
   fi
 
-  ok "Telegram webhooks now use the new VPS public IP."
+  ok "Telegram webhooks now use ${N8N_PUBLIC_ORIGIN} at the new VPS public IP."
 }
 
 show_pre_activation_summary() {
@@ -1077,8 +1304,8 @@ activate_services() {
   configure_telegram_webhooks
 
   title "Manual checks still required"
-  cat <<'EOF'
-  1. Point the n8n DNS record to the new VPS.
+  cat <<EOF
+  1. Point ${N8N_PUBLIC_HOSTNAME} to the new VPS in DNS.
   2. Check Caddy logs and HTTPS.
   3. Open n8n and verify users, credentials and workflows.
   4. Test critical workflows and Playwright MCP.
