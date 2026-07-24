@@ -52,10 +52,12 @@ Redis и Docker-образы намеренно не копируются.
 5. Показывает snapshots и восстанавливает выбранный.
 6. Восстанавливает Selfhost AI и до создания контейнеров предлагает сохранить прежний либо выбрать новый базовый домен.
 7. Для нового домена показывает рассчитанную замену заполненных `*_HOSTNAME`, изменяет только их и проверяет итоговый `WEBHOOK_URL`.
-8. Восстанавливает PostgreSQL, volumes, Playwright и backup automation.
-9. Не запускает production n8n без точного подтверждения `ACTIVATE`.
-10. После запуска обнаруживает активные Telegram Trigger и может перенести их webhook на выбранный hostname и публичный IPv4 нового VPS только после проверки DNS и HTTPS.
-11. Включает backup timer только после успешной проверки `sftp homenas-backup`.
+8. Восстанавливает PostgreSQL и при остановленном n8n устанавливает `active=false` всем первоначально опубликованным workflow, удаляет их восстановленные маршруты из `webhook_entity` и сохраняет ID, названия и наличие `Telegram Trigger` в recovery workspace.
+9. Восстанавливает volumes, Playwright и backup automation.
+10. Не запускает production n8n без точного подтверждения `ACTIVATE`; после запуска все восстановленные workflow остаются `Unpublished`.
+11. Только после точного `WORKFLOWS` возвращает `active=true` первоначально опубликованным workflow без Telegram Trigger и перезапускает основной n8n.
+12. Только после проверки DNS/HTTPS и точного `TELEGRAM` возвращает `active=true` Telegram-workflow, перезапускает основной n8n и переносит webhook на выбранный hostname и публичный IPv4 нового VPS.
+13. Включает backup timer только после успешной проверки `sftp homenas-backup`.
 
 Импорт PostgreSQL выполняется с компактной строкой прогресса и прошедшим временем. Подробный вывод `psql` сохраняется отдельно в `${RECOVERY_RUN}/postgres-restore.log`; при ошибке скрипт останавливается и сообщает путь к нему.
 
@@ -82,9 +84,11 @@ Caddy сможет получить сертификат нового публи
 
 ## Telegram при смене домена
 
-Перед переносом Telegram webhook recovery-код проверяет, что A-запись выбранного `N8N_HOSTNAME` содержит подтверждённый публичный IPv4 и что HTTPS health check нового VPS успешен.
+Изоляция выполняется до первого запуска n8n прямым изменением `workflow_entity.active` для всех опубликованных workflow в уже восстановленной PostgreSQL. Поскольку n8n в этот момент остановлен, операция не вызывает lifecycle триггеров. Обычные workflow и Telegram-workflow сохраняются в разных логических группах: первые можно вернуть в исходное состояние подтверждением `WORKFLOWS`, вторые — только отдельным `TELEGRAM`.
 
-Код получает текущий URL через Telegram `getWebhookInfo`, заменяет только origin на `https://<N8N_HOSTNAME>`, сохраняет прежние path и query, а затем передаёт новый URL в `setWebhook` вместе с `ip_address`, `secret_token` и `allowed_updates`. После операции проверяются одновременно URL и IP.
+Это позволяет запустить восстановленную систему с полностью `Unpublished` workflow для безопасной проверки и устраняет сценарий, при котором одно подтверждение `ACTIVATE` на тестовой машине заменяло production-webhook ещё до запроса `TELEGRAM`, а последующая остановка тестовой машины могла удалить webhook полностью.
+
+Если `TELEGRAM` не подтверждён либо DNS/HTTPS не готовы, изолированные workflow остаются неактивными и старый webhook не меняется. После подтверждения код возвращает только сохранённым workflow состояние `active=true`, перезапускает основной n8n, получает текущий URL через Telegram `getWebhookInfo` и передаёт URL в `setWebhook` вместе с `ip_address`, `secret_token` и `allowed_updates`. После операции проверяются одновременно URL и IP.
 
 ## Аудит текущих workflow
 

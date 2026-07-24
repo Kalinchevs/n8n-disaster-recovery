@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -21,6 +21,10 @@ ENV_TEMP_FILE=""
 POSTGRES_RESTORE_PID=""
 TELEGRAM_WORKFLOWS_FILE="/tmp/n8n-recovery-telegram-workflows.json"
 TELEGRAM_CREDENTIALS_FILE="/tmp/n8n-recovery-telegram-credentials.json"
+ISOLATED_WORKFLOWS_FILE="/tmp/n8n-recovery-isolated-workflows.json"
+ISOLATED_WORKFLOWS_STATE_FILE=""
+ISOLATED_WORKFLOWS_COUNT=0
+TELEGRAM_ISOLATED_COUNT=0
 N8N_PUBLIC_HOSTNAME=""
 N8N_PUBLIC_ORIGIN=""
 
@@ -77,7 +81,8 @@ cleanup() {
      docker inspect n8n >/dev/null 2>&1; then
     docker exec n8n rm -f -- \
       "$TELEGRAM_WORKFLOWS_FILE" \
-      "$TELEGRAM_CREDENTIALS_FILE" >/dev/null 2>&1 || true
+      "$TELEGRAM_CREDENTIALS_FILE" \
+      "$ISOLATED_WORKFLOWS_FILE" >/dev/null 2>&1 || true
   fi
 }
 
@@ -749,6 +754,11 @@ wait_for_postgres() {
   return 1
 }
 
+postgres_query() {
+  docker exec -i postgres sh -c \
+    'exec psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "${POSTGRES_DB:-$POSTGRES_USER}"'
+}
+
 restore_postgres() {
   local restore_status
   local started_at
@@ -813,6 +823,78 @@ restore_postgres() {
   fi
 
   ok "PostgreSQL restore finished. Log: ${POSTGRES_LOG}"
+}
+
+isolate_active_workflows() {
+  local workflow_json
+  local remaining_active
+
+  step "Isolating restored published workflows"
+  ISOLATED_WORKFLOWS_STATE_FILE="${RECOVERY_RUN}/isolated-workflows.json"
+
+  workflow_json=$(postgres_query <<'SQL'
+SELECT COALESCE(
+  jsonb_agg(
+    jsonb_build_object(
+      'id', id,
+      'name', name,
+      'hasTelegramTrigger', EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(nodes::jsonb) AS node
+        WHERE node->>'type' = 'n8n-nodes-base.telegramTrigger'
+      )
+    )
+    ORDER BY name
+  ),
+  '[]'::jsonb
+)
+FROM workflow_entity
+WHERE active IS TRUE;
+SQL
+  )
+
+  jq -e 'type == "array"' <<< "$workflow_json" >/dev/null || \
+    fail "Could not identify restored published workflows."
+  printf '%s\n' "$workflow_json" > "$ISOLATED_WORKFLOWS_STATE_FILE"
+  chmod 600 "$ISOLATED_WORKFLOWS_STATE_FILE"
+
+  ISOLATED_WORKFLOWS_COUNT=$(jq 'length' "$ISOLATED_WORKFLOWS_STATE_FILE")
+  TELEGRAM_ISOLATED_COUNT=$(jq \
+    '[.[] | select(.hasTelegramTrigger == true)] | length' \
+    "$ISOLATED_WORKFLOWS_STATE_FILE")
+  if (( ISOLATED_WORKFLOWS_COUNT == 0 )); then
+    ok "No published workflows require isolation."
+    return 0
+  fi
+
+  postgres_query >/dev/null <<'SQL'
+BEGIN;
+
+DELETE FROM webhook_entity
+WHERE "workflowId" IN (
+  SELECT id
+  FROM workflow_entity
+  WHERE active IS TRUE
+);
+
+UPDATE workflow_entity
+SET active = FALSE
+WHERE active IS TRUE;
+
+COMMIT;
+SQL
+
+  remaining_active=$(postgres_query <<'SQL'
+SELECT count(*)
+FROM workflow_entity
+WHERE active IS TRUE;
+SQL
+  )
+  [[ "$remaining_active" == "0" ]] || \
+    fail "Restored published workflows could not be isolated."
+
+  warn "Restored ${ISOLATED_WORKFLOWS_COUNT} published workflow(s) as unpublished."
+  warn "They cannot perform external actions before separate confirmation."
 }
 
 restore_n8n_volume() {
@@ -1097,6 +1179,113 @@ verify_public_endpoint() {
   ok "DNS and HTTPS are ready for ${N8N_PUBLIC_ORIGIN}."
 }
 
+clear_telegram_temp_files() {
+  docker exec n8n rm -f -- \
+    "$TELEGRAM_WORKFLOWS_FILE" \
+    "$TELEGRAM_CREDENTIALS_FILE" \
+    "$ISOLATED_WORKFLOWS_FILE"
+}
+
+wait_for_n8n() {
+  local status=""
+
+  for _ in $(seq 1 90); do
+    status=$(docker inspect \
+      --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+      n8n 2>/dev/null || true)
+
+    if [[ "$status" == "healthy" || "$status" == "running" ]]; then
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  return 1
+}
+
+reactivate_isolated_workflows() {
+  local workflow_group="$1"
+  local description="$2"
+  local id
+  local id_list=""
+  local active_count
+  local -a workflow_ids
+
+  mapfile -t workflow_ids < <(
+    jq -r --arg group "$workflow_group" '
+      .[]
+      | select(
+          if $group == "telegram"
+          then .hasTelegramTrigger == true
+          else .hasTelegramTrigger != true
+          end
+        )
+      | .id
+    ' "$ISOLATED_WORKFLOWS_STATE_FILE"
+  )
+  (( ${#workflow_ids[@]} > 0 )) || return 0
+
+  for id in "${workflow_ids[@]}"; do
+    [[ "$id" =~ ^[a-zA-Z0-9_-]+$ ]] || \
+      fail "Workflow isolation state contains an invalid workflow ID."
+    id_list+="${id_list:+, }'${id}'"
+  done
+
+  postgres_query >/dev/null <<SQL
+UPDATE workflow_entity
+SET active = TRUE
+WHERE id IN (${id_list});
+SQL
+
+  active_count=$(postgres_query <<SQL
+SELECT count(*)
+FROM workflow_entity
+WHERE active IS TRUE
+  AND id IN (${id_list});
+SQL
+  )
+
+  [[ "$active_count" == "${#workflow_ids[@]}" ]] || \
+    fail "Could not reactivate all ${description}."
+
+  step "Restarting n8n with ${description} active"
+  docker restart n8n >/dev/null
+  wait_for_n8n || fail "n8n did not become ready after workflow activation."
+}
+
+configure_restored_workflows() {
+  local workflow_count
+  local confirmation
+
+  [[ -s "$ISOLATED_WORKFLOWS_STATE_FILE" ]] || return 0
+  workflow_count=$(jq \
+    '[.[] | select(.hasTelegramTrigger != true)] | length' \
+    "$ISOLATED_WORKFLOWS_STATE_FILE")
+  (( workflow_count > 0 )) || return 0
+
+  title "Restored workflow publication"
+  printf 'Originally published non-Telegram workflows: %s\n' "$workflow_count"
+  jq -r \
+    '.[] | select(.hasTelegramTrigger != true) | "  - \(.name)"' \
+    "$ISOLATED_WORKFLOWS_STATE_FILE"
+  printf '\n'
+  warn "Publishing these workflows can immediately start schedules, webhooks and external actions."
+  read -r -p \
+    "Type WORKFLOWS to restore their published state, or press Enter to keep them unpublished: " \
+    confirmation
+
+  if [[ "$confirmation" != "WORKFLOWS" ]]; then
+    warn "Restored workflows remain unpublished."
+    return 0
+  fi
+
+  reactivate_isolated_workflows \
+    "non-telegram" \
+    "the confirmed restored workflows"
+  ok "Originally published non-Telegram workflows are active."
+}
+
 configure_telegram_webhooks() {
   local trigger_json
   local trigger_count
@@ -1105,26 +1294,43 @@ configure_telegram_webhooks() {
   local confirmation
   local telegram_status=0
 
-  step "Detecting active Telegram Trigger nodes"
+  if [[ ! -s "$ISOLATED_WORKFLOWS_STATE_FILE" ]] || \
+     (( TELEGRAM_ISOLATED_COUNT == 0 )); then
+    ok "No originally active Telegram Trigger workflows require activation."
+    return 0
+  fi
 
-  docker exec n8n rm -f -- \
-    "$TELEGRAM_WORKFLOWS_FILE" \
-    "$TELEGRAM_CREDENTIALS_FILE"
+  step "Inspecting isolated Telegram Trigger workflows"
+
+  clear_telegram_temp_files
+  docker cp \
+    "$ISOLATED_WORKFLOWS_STATE_FILE" \
+    "n8n:${ISOLATED_WORKFLOWS_FILE}"
+  docker exec n8n chmod 600 "$ISOLATED_WORKFLOWS_FILE"
 
   if ! docker exec n8n n8n export:workflow \
       --all \
       --output="$TELEGRAM_WORKFLOWS_FILE" >/dev/null; then
-    warn "Could not inspect restored workflows. Telegram webhook recovery was skipped."
+    warn "Could not inspect restored workflows."
+    warn "Isolated Telegram workflows remain inactive; the existing webhook was not changed."
     return 0
   fi
 
   trigger_json=$(docker exec n8n node -e '
     const fs = require("fs");
     const exported = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const isolated = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
     const workflows = Array.isArray(exported) ? exported : [exported];
+    const isolatedIds = new Set(
+      isolated
+        .filter((item) => item.hasTelegramTrigger === true)
+        .map((item) => String(item.id)),
+    );
     const triggers = [];
 
-    for (const workflow of workflows.filter((item) => item.active === true)) {
+    for (const workflow of workflows.filter(
+      (item) => isolatedIds.has(String(item.id)),
+    )) {
       for (const node of workflow.nodes || []) {
         if (node.type !== "n8n-nodes-base.telegramTrigger") continue;
         triggers.push({
@@ -1136,17 +1342,18 @@ configure_telegram_webhooks() {
     }
 
     process.stdout.write(JSON.stringify(triggers));
-  ' "$TELEGRAM_WORKFLOWS_FILE")
+  ' "$TELEGRAM_WORKFLOWS_FILE" "$ISOLATED_WORKFLOWS_FILE")
 
   trigger_count=$(jq 'length' <<< "$trigger_json")
   if (( trigger_count == 0 )); then
-    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
-    ok "No active Telegram Trigger nodes were found."
+    clear_telegram_temp_files
+    warn "No Telegram Trigger nodes matched the isolated workflow state."
+    warn "Isolated Telegram workflows remain inactive; the existing webhook was not changed."
     return 0
   fi
 
   title "Telegram webhook failover"
-  printf 'Active Telegram triggers found: %s\n' "$trigger_count"
+  printf 'Originally active Telegram triggers isolated: %s\n' "$trigger_count"
   jq -r '.[] | "  - \(.workflow) / \(.node) [\(.credential)]"' <<< "$trigger_json"
 
   detected_ip=$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
@@ -1167,14 +1374,16 @@ configure_telegram_webhooks() {
   fi
 
   if ! valid_ipv4 "$target_ip"; then
-    warn "Invalid IPv4 address. Telegram webhook recovery was skipped."
-    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
+    warn "Invalid IPv4 address."
+    warn "Isolated Telegram workflows remain inactive; the existing webhook was not changed."
+    clear_telegram_temp_files
     return 0
   fi
 
   if ! verify_public_endpoint "$target_ip"; then
-    warn "Telegram webhook recovery was skipped until DNS and HTTPS are ready."
-    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
+    warn "Telegram activation was skipped until DNS and HTTPS are ready."
+    warn "Isolated Telegram workflows remain inactive; the existing webhook was not changed."
+    clear_telegram_temp_files
     return 0
   fi
 
@@ -1183,8 +1392,9 @@ configure_telegram_webhooks() {
     confirmation
 
   if [[ "$confirmation" != "TELEGRAM" ]]; then
-    warn "Telegram webhook redirection was skipped."
-    docker exec n8n rm -f -- "$TELEGRAM_WORKFLOWS_FILE"
+    warn "Telegram activation and webhook redirection were skipped."
+    warn "Isolated Telegram workflows remain inactive; the existing webhook was not changed."
+    clear_telegram_temp_files
     return 0
   fi
 
@@ -1193,30 +1403,42 @@ configure_telegram_webhooks() {
       --all \
       --decrypted \
       --output="$TELEGRAM_CREDENTIALS_FILE" >/dev/null; then
-    warn "Credential export failed. Telegram webhook recovery was skipped."
-    docker exec n8n rm -f -- \
-      "$TELEGRAM_WORKFLOWS_FILE" \
-      "$TELEGRAM_CREDENTIALS_FILE"
+    warn "Credential export failed."
+    warn "Isolated Telegram workflows remain inactive; the existing webhook was not changed."
+    clear_telegram_temp_files
     return 0
   fi
   docker exec n8n chmod 600 "$TELEGRAM_CREDENTIALS_FILE"
+
+  reactivate_isolated_workflows \
+    "telegram" \
+    "the confirmed Telegram workflows"
 
   step "Redirecting Telegram webhooks to ${N8N_PUBLIC_ORIGIN} at ${target_ip}"
   docker exec -i n8n node - \
     "$target_ip" \
     "$N8N_PUBLIC_HOSTNAME" \
     "$TELEGRAM_WORKFLOWS_FILE" \
+    "$ISOLATED_WORKFLOWS_FILE" \
     "$TELEGRAM_CREDENTIALS_FILE" <<'NODE' || telegram_status=$?
 const fs = require('fs');
 
 const targetIp = process.argv[2];
 const targetHostname = process.argv[3];
 const workflowExport = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
-const credentials = JSON.parse(fs.readFileSync(process.argv[5], 'utf8'));
+const isolated = JSON.parse(fs.readFileSync(process.argv[5], 'utf8'));
+const credentials = JSON.parse(fs.readFileSync(process.argv[6], 'utf8'));
 const workflows = Array.isArray(workflowExport) ? workflowExport : [workflowExport];
+const isolatedIds = new Set(
+  isolated
+    .filter((item) => item.hasTelegramTrigger === true)
+    .map((item) => String(item.id)),
+);
 const activeTriggers = [];
 
-for (const workflow of workflows.filter((item) => item.active === true)) {
+for (const workflow of workflows.filter(
+  (item) => isolatedIds.has(String(item.id)),
+)) {
   for (const node of workflow.nodes || []) {
     if (node.type === 'n8n-nodes-base.telegramTrigger') {
       activeTriggers.push({ workflow, node });
@@ -1305,16 +1527,15 @@ async function telegramRequest(baseUrl, token, method, body) {
 });
 NODE
 
-  docker exec n8n rm -f -- \
-    "$TELEGRAM_WORKFLOWS_FILE" \
-    "$TELEGRAM_CREDENTIALS_FILE"
+  clear_telegram_temp_files
 
   if (( telegram_status != 0 )); then
-    warn "One or more Telegram webhooks could not be redirected. Review the messages above."
+    warn "Telegram workflows are active, but one or more webhooks could not be pinned."
+    warn "Review the messages above before stopping the previous production system."
     return 0
   fi
 
-  ok "Telegram webhooks now use ${N8N_PUBLIC_ORIGIN} at the new VPS public IP."
+  ok "Telegram workflows are active and use ${N8N_PUBLIC_ORIGIN} at the new VPS public IP."
 }
 
 show_pre_activation_summary() {
@@ -1330,12 +1551,20 @@ Restored and prepared:
   - enabled standard Selfhost AI profile data
   - Playwright configuration
   - daily backup automation
+  - originally published workflows restored as unpublished: ${ISOLATED_WORKFLOWS_COUNT}
+  - originally active Telegram workflows isolated: ${TELEGRAM_ISOLATED_COUNT}
 
 Not started yet:
   - n8n main process
   - n8n workers and task runner
   - Playwright
   - backup timer
+
+Workflow safety:
+  - ACTIVATE starts n8n with all restored workflows unpublished
+  - non-Telegram workflows require exact WORKFLOWS confirmation
+  - Telegram workflows require exact TELEGRAM confirmation
+  - ACTIVATE alone cannot perform workflow actions or change the production bot webhook
 
 Before activation:
   1. Confirm the old VPS is stopped or inaccessible.
@@ -1361,6 +1590,7 @@ activate_services() {
   step "Starting the restored Selfhost AI stack"
   cd "$SELFHOST_DIR"
   "${COMPOSE[@]}" up -d
+  wait_for_n8n || fail "n8n did not become ready within three minutes."
 
   step "Starting Playwright"
   cd "$PLAYWRIGHT_DIR"
@@ -1382,6 +1612,7 @@ activate_services() {
   title "Container status"
   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
 
+  configure_restored_workflows
   configure_telegram_webhooks
 
   title "Manual checks still required"
@@ -1389,10 +1620,12 @@ activate_services() {
   1. Point ${N8N_PUBLIC_HOSTNAME} to the new VPS in DNS.
   2. Check Caddy logs and HTTPS.
   3. Open n8n and verify users, credentials and workflows.
-  4. Test critical workflows and Playwright MCP.
-  5. Disable Tailscale key expiry for the new VPS.
-  6. Run and verify a new Restic backup.
-  7. Keep the old VPS stopped until all checks pass.
+  4. Confirm only the intended workflows were published after WORKFLOWS approval.
+  5. Confirm Telegram workflows are active only after TELEGRAM approval.
+  6. Test critical workflows and Playwright MCP.
+  7. Disable Tailscale key expiry for the new VPS.
+  8. Run and verify a new Restic backup.
+  9. Keep the old VPS stopped until all checks pass.
 EOF
 }
 
@@ -1433,6 +1666,7 @@ EOF
   regenerate_welcome_page
   restore_registry_credentials
   restore_postgres
+  isolate_active_workflows
   restore_n8n_volume
   restore_support_volumes
   restore_standard_optional_profiles
