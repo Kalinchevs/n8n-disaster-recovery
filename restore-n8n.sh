@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -677,6 +677,7 @@ restore_selfhost_project() {
 
   COMPOSE=(
     docker compose
+    --progress quiet
     -f docker-compose.yml
     -f docker-compose.n8n-workers.yml
     -f docker-compose.override.yml
@@ -1364,6 +1365,7 @@ activate_services() {
   step "Starting Playwright"
   cd "$PLAYWRIGHT_DIR"
   docker compose \
+    --progress quiet \
     --env-file stack.env \
     -p playwright \
     -f docker-compose.yml \
