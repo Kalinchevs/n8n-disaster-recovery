@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -18,6 +18,7 @@ TEMP_KNOWN_HOSTS=""
 LOG_FILE=""
 SNAPSHOT_JSON_FILE=""
 ENV_TEMP_FILE=""
+POSTGRES_RESTORE_PID=""
 TELEGRAM_WORKFLOWS_FILE="/tmp/n8n-recovery-telegram-workflows.json"
 TELEGRAM_CREDENTIALS_FILE="/tmp/n8n-recovery-telegram-credentials.json"
 N8N_PUBLIC_HOSTNAME=""
@@ -61,6 +62,12 @@ fail() {
 }
 
 cleanup() {
+  if [[ -n "$POSTGRES_RESTORE_PID" ]] && \
+     kill -0 "$POSTGRES_RESTORE_PID" 2>/dev/null; then
+    kill "$POSTGRES_RESTORE_PID" 2>/dev/null || true
+    wait "$POSTGRES_RESTORE_PID" 2>/dev/null || true
+  fi
+
   [[ -n "$SFTP_PASSWORD_FILE" ]] && rm -f -- "$SFTP_PASSWORD_FILE"
   [[ -n "$TEMP_KNOWN_HOSTS" ]] && rm -f -- "$TEMP_KNOWN_HOSTS"
   [[ -n "$SNAPSHOT_JSON_FILE" ]] && rm -f -- "$SNAPSHOT_JSON_FILE"
@@ -716,6 +723,14 @@ wait_for_postgres() {
 }
 
 restore_postgres() {
+  local restore_status
+  local started_at
+  local elapsed
+  local minutes
+  local seconds
+  local spinner_index=0
+  local -a spinner=('|' '/' '-' '\')
+
   step "Starting a fresh PostgreSQL 17 instance and Redis"
   cd "$SELFHOST_DIR"
   "${COMPOSE[@]}" up -d postgres redis
@@ -724,13 +739,51 @@ restore_postgres() {
   step "Restoring all PostgreSQL databases and roles"
   POSTGRES_LOG="${RECOVERY_RUN}/postgres-restore.log"
 
-  gunzip -c "$RESTORED_DUMP" |
-    docker exec -i postgres sh -c \
-      'psql -U "$POSTGRES_USER" -d postgres' \
-    2>&1 | tee "$POSTGRES_LOG"
+  (
+    trap - ERR
+    gunzip -c "$RESTORED_DUMP" |
+      docker exec -i postgres sh -c \
+        'psql -U "$POSTGRES_USER" -d postgres'
+  ) > "$POSTGRES_LOG" 2>&1 &
+  POSTGRES_RESTORE_PID=$!
+  started_at=$SECONDS
 
-  docker exec postgres sh -c \
-    'psql -U "$POSTGRES_USER" -d postgres -c "\\l"'
+  if [[ -t 0 ]]; then
+    while kill -0 "$POSTGRES_RESTORE_PID" 2>/dev/null; do
+      elapsed=$((SECONDS - started_at))
+      minutes=$((elapsed / 60))
+      seconds=$((elapsed % 60))
+      printf '\r  PostgreSQL restore %s  elapsed %02d:%02d' \
+        "${spinner[$spinner_index]}" "$minutes" "$seconds" > /dev/tty
+      spinner_index=$(((spinner_index + 1) % ${#spinner[@]}))
+      sleep 1
+    done
+  fi
+
+  if wait "$POSTGRES_RESTORE_PID"; then
+    restore_status=0
+  else
+    restore_status=$?
+  fi
+  POSTGRES_RESTORE_PID=""
+
+  elapsed=$((SECONDS - started_at))
+  minutes=$((elapsed / 60))
+  seconds=$((elapsed % 60))
+  if [[ -t 0 ]]; then
+    printf '\r  PostgreSQL restore finished in %02d:%02d                 \n' \
+      "$minutes" "$seconds" > /dev/tty
+  fi
+
+  if (( restore_status != 0 )); then
+    fail "PostgreSQL restore failed. Detailed log: ${POSTGRES_LOG}"
+  fi
+
+  if ! docker exec postgres sh -c \
+      'psql -U "$POSTGRES_USER" -d postgres -c "\\l"' \
+      >> "$POSTGRES_LOG" 2>&1; then
+    fail "PostgreSQL validation failed. Detailed log: ${POSTGRES_LOG}"
+  fi
 
   ok "PostgreSQL restore finished. Log: ${POSTGRES_LOG}"
 }
