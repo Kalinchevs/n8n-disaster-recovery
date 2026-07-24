@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Interactive disaster-recovery bootstrap for an n8n Selfhost AI installation.
 # This file intentionally contains no infrastructure secrets.
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 EXPECTED_UBUNTU_VERSION="24.04"
 
 SELFHOST_DIR="/root/selfhost-ai"
@@ -205,6 +205,9 @@ install_docker() {
 }
 
 install_tailscale() {
+  local login_attempt=1
+  local -a login_command
+
   if command -v tailscale >/dev/null 2>&1; then
     ok "Tailscale is already installed."
   else
@@ -218,14 +221,37 @@ install_tailscale() {
 
   systemctl enable --now tailscaled
 
-  if ! tailscale ip -4 2>/dev/null | grep -q '^100\.'; then
+  while ! tailscale ip -4 2>/dev/null | grep -q '^100\.'; do
     title "Tailscale login required"
     printf '%s\n' \
       "A login URL will be displayed." \
       "Open it in a browser and sign in to the same tailnet as your Synology." \
-      "Return here after authorization."
-    tailscale up
-  fi
+      "Return here after authorization." \
+      "This attempt will stop after five minutes if registration does not finish."
+
+    login_command=(tailscale up --timeout=5m)
+    if (( login_attempt > 1 )); then
+      login_command+=(--force-reauth)
+      printf '%s\n' \
+        "A fresh login URL will be generated; do not reuse an earlier URL."
+    fi
+
+    if ! "${login_command[@]}"; then
+      warn "Tailscale authorization attempt ${login_attempt} did not complete."
+    fi
+
+    if tailscale ip -4 2>/dev/null | grep -q '^100\.'; then
+      break
+    fi
+
+    warn "This VPS is still not connected to Tailscale."
+    warn "A temporary Tailscale control-plane error or pending device approval may be the cause."
+    if ! confirm "Retry Tailscale authorization with a new login URL?" "yes"; then
+      fail "Tailscale authorization is required to reach the Restic repository."
+    fi
+
+    login_attempt=$((login_attempt + 1))
+  done
 
   tailscale status >/dev/null
   ok "This VPS is connected to Tailscale."
